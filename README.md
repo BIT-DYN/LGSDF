@@ -7,7 +7,7 @@ LGSDF: Signed Distance Fields Continual Global Learning Aided by Local Updating
 
 ## Install
 ```bash
-it clone https://github.com/BIT-DYN/LGSDF
+git clone https://github.com/BIT-DYN/LGSDF
 conda env create -f environment.yml
 conda activate lgsdf
 ```
@@ -32,4 +32,4 @@ python train.py --config configs/scannet.json
 ```
 
 ## Result
-<img src="https://github.com/BIT-DYN/LGSDF/blob/main/figs/com.png" >
+<img src="https://github.com/BIT-DYN/LGSDF/blob/main/figs/com.png"  width="50%">
