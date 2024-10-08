@@ -1,23 +1,23 @@
 {
     "dataset": {
         "format": "ScanNet",
-        "seq_dir": "/media/dyn/DYN1/Research/dataset/iSDF/seqs/scene0010_00/",
-        "gt_sdf_dir": "/media/dyn/DYN1/Research/dataset/iSDF/gt_sdfs/scene0010_00/",
-        "noisy_depth": 1,
+        "seq_dir": "/data/dyn/dataset/seqs/scene0031_00/",
+        "gt_sdf_dir": "/data/dyn/dataset/gt_sdfs/scene0031_00/",
+        "noisy_depth": 0,
         "im_indices": [0, 200, 400, 500, 570, 650],
-        "scannet_dir": "/media/dyn/DYN1/Research/dataset/iSDF/seqs/scene0010_00/"
+        "scannet_dir": "/data/dyn/dataset/seqs/scene0031_00/"
     },
     "eval": {
         "do_vox_comparison": 0,
-        "eval_pts_root": "/media/dyn/DYN1/Research/dataset/iSDF/eval_pts/",
-        "do_eval": 0,
-        "eval_freq_s": 10,
+        "eval_pts_root": "/data/dyn/dataset/eval_pts/",
+        "do_eval": 1,
+        "eval_freq_s": 5,
         "sdf_eval": 1,
         "mesh_eval": 1
     },
     "save": {
         "save_period": 10,
-        "save_checkpoints": 1,
+        "save_checkpoints": 0,
         "save_slices": 1,
         "save_meshes": 1
     },
@@ -29,8 +29,8 @@
         "steps": 20000
     },
     "sample": {
-        "n_rays": 200,
-        "n_rays_is_kf": 400,
+        "n_rays": 400,
+        "n_rays_is_kf": 800,
         "n_strat_samples": 22,
         "n_surf_samples": 5,
         "depth_range": [0.07, 12.0],
@@ -40,7 +40,7 @@
     "model": {
         "refine_poses": 0,
         "do_active": 0,
-        "frac_time_perception": 2.0,
+        "frac_time_perception": 1,
         "scale_output": 0.14,
         "noise_std": 0.25,
         "noise_kf": 0.08,
@@ -48,8 +48,8 @@
         "window_size": 5,
         "hidden_layers_block": 2,
         "hidden_feature_size": 256,
-        "iters_per_kf": 20,
-        "iters_per_frame": 10,
+        "iters_per_kf": 10,
+        "iters_per_frame": 5,
         "kf_dist_th": 0.1,
         "kf_pixel_ratio": 0.65,
         "embedding": {
@@ -63,11 +63,11 @@
     "loss": {
         "bounds_method": "pc",
         "loss_type": "L1",
-        "trunc_weight": 3.38344020, 
-        "trunc_distance": 0.2956502,
-        "eik_weight": 0.0268,
+        "trunc_weight": 5.38344020, 
+        "trunc_distance": 0.2936502,
+        "eik_weight": 0.268,
         "eik_apply_dist": 0.1,
-        "grad_weight": 0.00018,
+        "grad_weight": 0.018,
         "orien_loss": 0
     }
 }

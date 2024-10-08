@@ -19,6 +19,9 @@ import os
 import kdtree
 import time
 import open3d as o3d
+import torch.nn.functional as F
+from scipy.ndimage import distance_transform_edt
+import time
 
 from lgsdf.datasets import (
     dataset, image_transforms, sdf_util, data_util
@@ -108,6 +111,7 @@ class Trainer():
 
     def set_scene_properties(self):
         # 加载了.obj文件
+        # self.scene_file = "/data/dyn/dataset/seqs/conference_room_1/scene/mesh.ply"
         scene_mesh = trimesh.exchange.load.load(self.scene_file, process=False)
         # bounds_transform是将网格边界框的中心移动到原点的变换矩阵。
         # bounds_extents是使用bounds_ transform变换后mesh的范围
@@ -140,6 +144,12 @@ class Trainer():
         print("The scale of scene is: ", self.scene_scale_np*2)
         # 得到每个grid的坐标
         self.grid_pc = self.grid_pc.view(-1, 3).to(self.device)
+        # 计算每列的最小值和最大值
+        min_values, _ = torch.min(self.grid_pc, dim=0)
+        max_values, _ = torch.max(self.grid_pc, dim=0)
+        # 打印结果
+        print("最小值：", min_values)
+        print("最大值：", max_values)
         # print("From grid ", self.grid_pc[0].cpu().numpy(), " to grid ", self.grid_pc[-1].cpu().numpy(),)
         # print("The transform of scene is: \n", self.bounds_transform.cpu().numpy())
         # dyndyn：这个grid_pc就是每个栅格的中心点，下面可以得到每个grid的上下界限
@@ -152,6 +162,8 @@ class Trainer():
         # self.grid_activate = grid_activate == 1
         # 存储被激活grid的sdf值，以及权重，以及loss，还有grad
         self.grid_sdf = torch.zeros(self.grid_pc.shape[0], 6).to(self.device)
+        
+        self.all_grid_indices = torch.arange(len(self.grid_pc), device=self.device)
 
         # self.up是为了俯视图t
         # 0
@@ -161,19 +173,24 @@ class Trainer():
         # 判断是否向上对齐了
         self.up_aligned = np.dot(self.grid_up, self.up) > 0
 
+        self.all_gt_pc = None
+        self.rand_id_ok = None
+
     def set_params(self):
-        # 本次深度图像序列的目录，如"/media/dyn/DYN1/Research/dataset/iSDF/seqs/apt_3_obj/"
+        # 本次深度图像序列的目录，如"/data/dyn/dataset/seqs/apt_3_obj/"
         self.seq_dir = self.config["dataset"]["seq_dir"]
         # 本次序列的名称，如apt_3_obj
         self.seq = [x for x in self.seq_dir.split('/') if x != ''][-1]
-        # 图像所在目录，如"/media/dyn/DYN1/Research/dataset/iSDF/seqs/apt_3_obj/results"
+        # 图像所在目录，如"/data/dyn/dataset/seqs/apt_3_obj/results"
         self.ims_file = os.path.join(self.seq_dir, "results")
         # 数据集，如replicaCAD
         self.dataset_format = self.config["dataset"]["format"]
-        # seq的跟目录，可以看到所有数据的位置，如"/media/dyn/DYN1/Research/dataset/iSDF/seqs"
+        # seq的跟目录，可以看到所有数据的位置，如"/data/dyn/dataset/seqs"
         seq_root = "/".join(self.seq_dir.split('/')[:-2])
-        # 找到对应的info文件，里面记录了相机内参，如"/media/dyn/DYN1/Research/dataset/iSDF/seqs/replicaCAD_info.json"
+        # 找到对应的info文件，里面记录了相机内参，如"/data/dyn/dataset/seqs/replicaCAD_info.json"
         info_file = os.path.join(seq_root, f"{self.dataset_format}_info.json")
+        if "gt_mesh_dir" in self.config["dataset"]:
+            info_file = os.path.join(seq_root, f"Myself_info.json")
         with open(info_file, 'r') as f:
             # 相机内参文件
             self.seq_info = json.load(f)
@@ -185,15 +202,18 @@ class Trainer():
         # 真值所用的，gt
         self.obj_bounds_file = None
         if os.path.exists(self.seq_dir + "/obj_bounds.txt"):
-            # 如果有确定边界的文件，如"/media/dyn/DYN1/Research/dataset/iSDF/seqs/apt_3_obj/obj_bounds.txt"
+            # 如果有确定边界的文件，如"/data/dyn/dataset/seqs/apt_3_obj/obj_bounds.txt"
             self.obj_bounds_file = self.seq_dir + "/obj_bounds.txt"
         self.gt_scene = False
+        self.sdf_transf_file = None
+        self.myself = False
         if "gt_sdf_dir" in self.config["dataset"]:
             # 确定真值场景
-            # 真值场景所在目录，如"/media/dyn/DYN1/Research/dataset/iSDF/gt_sdfs/apt_3/"
+            # 真值场景所在目录，如"/data/dyn/dataset/gt_sdfs/apt_3/"
             gt_sdf_dir = self.config["dataset"]["gt_sdf_dir"]
             # 真值场景的obj文件
             self.scene_file = gt_sdf_dir + "mesh.obj"
+            # self.scene_file = gt_sdf_dir + "mesh.ply"
             # 真值场景的以1cm为分辨率的sdf数据，用于评估
             self.gt_sdf_file = gt_sdf_dir + "/1cm/sdf.npy"
             # 真值场景的以1cm为分辨率的分段sdf数据，用于评估
@@ -201,6 +221,12 @@ class Trainer():
             # 到真值场景需要进行的变换，需要平移
             self.sdf_transf_file = gt_sdf_dir + "/1cm/transform.txt"
             self.gt_scene = True
+        if "gt_mesh_dir" in self.config["dataset"]:
+            gt_sdf_dir = self.config["dataset"]["gt_mesh_dir"]
+            self.scene_file = gt_sdf_dir + "mesh.ply"
+            self.gt_scene = True
+            self.myself = True
+
         self.scannet_dir = None
         if "scannet_dir" in self.config["dataset"]:
             # 如果有scannet，确定它的目录，目前没有
@@ -275,9 +301,9 @@ class Trainer():
         # 在哪些时间评估评估耗时
         self.eval_times = []
         if self.do_vox_comparison and "eval_pts_root" in self.config["eval"]:
-            # 评估所需要的目录，如"/media/dyn/DYN1/Research/dataset/iSDF/eval_pts/"
+            # 评估所需要的目录，如"/data/dyn/dataset/eval_pts/"
             self.eval_pts_root = self.config["eval"]["eval_pts_root"]
-            # 评估目录，如"/media/dyn/DYN1/Research/dataset/iSDF/eval_pts/vox/"
+            # 评估目录，如"/data/dyn/dataset/eval_pts/vox/"
             self.eval_pts_dir = self.config["eval"]["eval_pts_root"]
             self.eval_pts_dir += "vox/"
             # 确定和哪种分辨率的vox比较，如果需要实时全部用来处理的话，分辨率就是0.055，如果再快的话，只用一般时间处理就是0.078
@@ -291,15 +317,15 @@ class Trainer():
                 self.eval_pts_dir += "0.11/"
             else:
                 raise ValueError('Frace perception time not in [0.25, 0.5, 0.75, 1.]')
-            # 评估的目录，"/media/dyn/DYN1/Research/dataset/iSDF/eval_pts/vox/0.055/apt_3_obj/eval_pts/"
+            # 评估的目录，"/data/dyn/dataset/eval_pts/vox/0.055/apt_3_obj/eval_pts/"
             self.eval_pts_dir += [x for x in self.seq_dir.split('/') if x != ""][-1] + "/eval_pts/"
-            # 评估时间选择和voxblox的相同，其中的所有目录，如"/media/dyn/DYN1/Research/dataset/iSDF/eval_pts/vox/0.055/apt_3_obj/eval_pts/0.553"
+            # 评估时间选择和voxblox的相同，其中的所有目录，如"/data/dyn/dataset/eval_pts/vox/0.055/apt_3_obj/eval_pts/0.553"
             self.eval_times = [float(x) for x in os.listdir(self.eval_pts_dir)]
             self.eval_times.sort()
             print("eval pts dir", self.eval_pts_dir)
-        if self.do_eval:
+        # if self.do_eval:
             # 使用真值轨迹进行评估，只要评估就需要用到缓存数据
-            self.cached_dataset = eval_pts.get_cache_dataset(self.seq_dir, self.dataset_format, self.scannet_dir)
+        self.cached_dataset = eval_pts.get_cache_dataset(self.seq_dir, self.dataset_format, self.scannet_dir)
 
         # 保存所用的参数，save
         # 保存的周期 10
@@ -388,7 +414,10 @@ class Trainer():
             self.cy = self.seq_info["camera"]["cy"]
             self.H = self.seq_info["camera"]["h"]
             self.W = self.seq_info["camera"]["w"]
-
+        
+        self.k = torch.tensor([[self.fx, 0.0, self.cx],
+                  [0.0, self.fy, self.cy],
+                  [0.0, 0.0, 1.0]], device='cuda')
         reduce_factor = 10
         # 把图像缩小，不然计算量太大了，10倍缩小，参数也要缩小
         self.H_vis = self.H // reduce_factor
@@ -484,513 +513,6 @@ class Trainer():
         # 加载位置的尺寸
         self.sdf_dims = torch.tensor(sdf_grid.shape)
 
-    # Data methods ---------------------------------------
-
-    def load_data(self):
-        # 图像预处理
-        rgb_transform = transforms.Compose(
-            [image_transforms.BGRtoRGB()])
-        depth_transform = transforms.Compose(
-            [image_transforms.DepthScale(self.inv_depth_scale),
-             image_transforms.DepthFilter(self.max_depth)])
-        if self.dataset_format == "ScanNet":
-            dataset_class = dataset.ScanNetDataset
-            col_ext = ".jpg"
-            self.up = np.array([0., 0., 1.])
-            ims_file = self.scannet_dir
-        elif self.dataset_format == "replica":
-            dataset_class = dataset.ReplicaDataset
-            col_ext = ".jpg"
-            self.up = np.array([0., 1., 0.])
-            ims_file = self.ims_file
-        elif self.dataset_format == "replicaCAD":
-            dataset_class = dataset.ReplicaDataset
-            col_ext = ".png"
-            # 图像到俯视图需要进行的变换
-            self.up = np.array([0., 1., 0.])
-            ims_file = self.ims_file
-        # 数据集的类
-        self.scene_dataset = dataset_class(
-            ims_file,
-            self.traj_file,
-            rgb_transform=rgb_transform,
-            depth_transform=depth_transform,
-            col_ext=col_ext,
-            noisy_depth=self.noisy_depth,
-        )
-        if self.incremental is False:
-            # 如果不是增量式的话，要自己构建索引
-            if "im_indices" not in self.config["dataset"]:
-                if "n_random_views" in self.config["dataset"]:
-                    n_random_views = self.config["dataset"]["n_random_views"]
-                    if n_random_views > 0:
-                        n_dataset = len(self.scene_dataset)
-                        self.indices = np.random.choice(
-                            np.arange(0, n_dataset),
-                            size=n_random_views,
-                            replace=False)
-            print("Frame indices", self.indices)
-            idxs = self.indices
-            frame_data = self.get_data(idxs)
-            self.add_data(frame_data)
-
-    def get_data(self, idxs):
-        # 获取某帧数据的数据类，用于把数据都加载进来
-        frames_data = FrameData()
-        for idx in idxs:
-            # 返回rgb和深度图像的矩阵信息，以及pose
-            sample = self.scene_dataset[idx]
-            im_np = sample["image"][None, ...]
-            depth_np = sample["depth"][None, ...]
-            T_np = sample["T"][None, ...]
-            # rgb图像归一化了一下
-            im = torch.from_numpy(im_np).float().to(self.device) / 255.
-            depth = torch.from_numpy(depth_np).float().to(self.device)
-            T = torch.from_numpy(T_np).float().to(self.device)
-            # 一个数据操作的类
-            data = FrameData(
-                frame_id=np.array([idx]),
-                im_batch=im,
-                im_batch_np=im_np,
-                depth_batch=depth,
-                depth_batch_np=depth_np,
-                T_WC_batch=T,
-                T_WC_batch_np=T_np,
-            )
-            if self.do_normal:
-                # 需要计算法线，是需要的，得到整个点云，为点云计算法线，得到每个点的法线
-                pc = geometry.transform.pointcloud_from_depth_torch(depth[0], self.fx, self.fy, self.cx, self.cy)
-                normals = geometry.transform.estimate_pointcloud_normals(pc)
-                data.normal_batch = normals[None, :]
-                # dyndyn：计算渲染和深度的得分
-                # 渲染得分
-                normals_render = torch.sum(self.dirs_C[0] * normals, axis = 2)
-                normal_block = normals_render.view(self.loss_approx_factor, self.h_block, self.loss_approx_factor, self.w_block)
-                normal_loss = normal_block.var(dim=(1,3))
-                normal_loss[torch.isnan(normal_loss) ] = 0.
-                normal_loss = (normal_loss-normal_loss.min())/(normal_loss.max()-normal_loss.min())  
-                # 深度得分
-                depth_block = depth.view(self.loss_approx_factor, self.h_block, self.loss_approx_factor, self.w_block)
-                depth_loss = depth_block.var(dim=(1,3))
-                depth_loss = (depth_loss-depth_loss.min())/(depth_loss.max()-depth_loss.min())  
-                # 总得分并归一化
-                all_loss = 0.3 * normal_loss + 0.7 * depth_loss
-                scores = all_loss / all_loss.sum()
-                data.score_batch = scores[None, :]
-            if self.gt_traj is not None:
-                # 如果有真正的轨迹的话，其实用的不是真值
-                data.T_WC_gt = self.gt_traj[idx][None, ...]
-            # 添加数据，一定不是替换最后一个，因为这是一个空的数据类型
-            frames_data.add_frame_data(data, replace=False)
-        return frames_data
-
-    def add_data(self, data):
-        # 新的时刻添加新的数据进行，如果最后一帧不是关键帧，则新帧将替换批次中的最后一帧。
-        # dyndyn
-        replace = True
-        self.frames.add_frame_data(data, replace)
-
-    def add_frame(self, frame_data):
-        # 如果不管上一帧率是不是关键帧，都要计算新的帧的loss
-        self.frozen_sdf_map = copy.deepcopy(self.sdf_map)
-        # 添加数据进去
-        self.add_data(frame_data)
-        self.steps_since_frame = 0
-        self.last_is_keyframe = False
-        self.optim_frames = self.iters_per_frame
-        self.noise_std = self.noise_frame
-
-    # Keyframe methods ----------------------------------
-
-    def is_keyframe(self, T_WC, depth_gt):
-        # 判断某一帧是否为关键帧
-        # 对其进行采样
-        sample_pts = self.sample_points(depth_gt, T_WC, n_rays=self.n_rays_is_kf, dist_behind_surf=0.8)
-        pc = sample_pts["pc"]
-        z_vals = sample_pts["z_vals"]
-        depth_sample = sample_pts["depth_sample"]
-        #评估采样点的sdf
-        with torch.set_grad_enabled(False):
-            # 把添加了关键帧之后的模型冷冻一下，作为判断是否需要添加新的关键帧的依据
-            sdf = self.frozen_sdf_map(pc, noise_std=self.noise_std)
-        z_vals, ind1 = z_vals.sort(dim=-1)
-        ind0 = torch.arange(z_vals.shape[0])[:, None].repeat(1, z_vals.shape[1])
-        # sdf安装z_vals排了一下序, 但数目有限
-        sdf = sdf[ind0, ind1]
-        # 利用预测的sdf渲染图像，但只能得到光线位置的渲染 n x 27
-        view_depth = render.sdf_render_depth(z_vals, sdf)
-        # 计算渲染得到的图像与真值图像的采样位置的误差
-        loss = torch.abs(view_depth - depth_sample) / depth_sample
-        # 判断有哪些采样光线的loss低于设置的损失阈值
-        below_th = loss < self.kf_dist_th
-        size_loss = below_th.shape[0]
-        # loss较低的像素占比有多少
-        below_th_prop = below_th.sum().float() / size_loss
-        # 如果loss较低的比较少，也就是loss差异较大的比较多，那就是关键帧
-        is_keyframe = below_th_prop.item() < self.kf_pixel_ratio
-        # # 给出当前帧是否应该作为关键帧的依据
-        # print(
-        #     "Proportion of loss below threshold",
-        #     below_th_prop.item(),
-        #     "for KF should be less than",
-        #     self.kf_pixel_ratio,
-        #     ". Therefore is keyframe:",
-        #     is_keyframe
-        # )
-        return is_keyframe
-
-    def check_keyframe_latest(self):
-        """
-        returns whether or not to add a new frame.
-        返回是否需要添加一个新的帧进来
-        """
-        add_new_frame = False
-        if self.last_is_keyframe:
-            # 如果已经是关键帧，就不要在设定这是关键帧了
-            add_new_frame = True
-        else:
-            # Check if latest frame should be a keyframe.
-            # 检查最新帧是否应为关键帧。
-            T_WC = self.frames.T_WC_batch[-1].unsqueeze(0)
-            depth_gt = self.frames.depth_batch[-1].unsqueeze(0)
-            # 判断最新帧是否为关键帧
-            self.last_is_keyframe = self.is_keyframe(T_WC, depth_gt)
-            # 如果是关键帧的话，要把优化次数纠正一下
-            if self.last_is_keyframe:
-                self.optim_frames = self.iters_per_kf
-                # 噪声，不是很懂
-                self.noise_std = self.noise_kf
-            else:
-                add_new_frame = True
-        return add_new_frame
-
-
-    # Main training methods ----------------------------------
-
-    def sample_points(
-        self,
-        depth_batch,
-        T_WC_batch,
-        norm_batch=None,
-        score_batch=None,
-        active_loss_approx=None,
-        n_rays=None,
-        dist_behind_surf=None,
-        n_strat_samples=None,
-        n_surf_samples=None,
-    ):
-        # 得到所有的采样数据，用于训练
-        # 首先采样像素，然后沿反向投影光线采样深度，从而采样点。
-        if n_rays is None:
-            # 采样的光线数量
-            n_rays = self.n_rays
-        if dist_behind_surf is None:
-            # 考虑的障碍物后面的距离
-            dist_behind_surf = self.dist_behind_surf
-        if n_strat_samples is None:
-            # 均匀采样的个数
-            n_strat_samples = self.n_strat_samples
-        if n_surf_samples is None:
-            # 高斯采样的个数
-            n_surf_samples = self.n_surf_samples
-        # 这一批次用来训练的图像个数
-        n_frames = depth_batch.shape[0]
-        if active_loss_approx is None:
-            # 获取采样点的像素
-            if score_batch is not None:
-                indices_b, indices_h, indices_w = sample.sample_pixels_score(score_batch, n_rays, n_frames, self.H, self.W, self.h_block, self.w_block,
-                                                                                                                    self.loss_approx_factor, self.c, self.r,  device=self.device)
-            else:
-                indices_b, indices_h, indices_w = sample.sample_pixels( n_rays, n_frames, self.H, self.W, device=self.device)
-        else:
-            raise Exception('Active sampling not currently supported.')
-
-        # 上面只是得到采样像素，还要得到采样光线，对深度为0的采样点过滤，并获得了光线方向dirs_C_sample
-        get_masks = active_loss_approx is None
-        (
-            dirs_C_sample,
-            depth_sample,
-            norm_sample,
-            T_WC_sample,
-            binary_masks,
-            indices_b,
-            indices_h,
-            indices_w
-        ) = sample.get_batch_data(
-            depth_batch,
-            T_WC_batch,
-            self.dirs_C,
-            indices_b,
-            indices_h,
-            indices_w,
-            norm_batch=norm_batch,
-            get_masks=get_masks,
-        )
-
-        # # debug: 看看点对不对
-        # depth = depth_batch[indices_b[0]].cpu().numpy()
-        # indices_b_np = indices_b.cpu().numpy()
-        # indices_w_np = indices_w.cpu().numpy()
-        # indices_h_np = indices_h.cpu().numpy()
-        # depth_viz = imgviz.depth2rgb(depth)
-        # num = np.sum(indices_b_np == indices_b_np[0])
-        # for i in range(num):
-        #     cv2.circle(depth_viz, (indices_w_np[i], indices_h_np[i]), 6, (255, 255, 255), -1)
-        # cv2.imshow("depth", depth_viz)
-        # cv2.waitKey(0)
-
-        # 最大深度，为真实深度基础上加上高斯采样的范围
-        max_depth = depth_sample + dist_behind_surf
-        # 还要在光线上采样，得到了世界坐标下的点云数据
-        pc, z_vals, pc_surf, z_vals_surf = sample.sample_along_rays(
-            T_WC_sample,
-            self.min_depth,
-            max_depth,
-            n_strat_samples,
-            n_surf_samples,
-            dirs_C_sample,
-            gt_depth=depth_sample,
-            grad=False,
-        )
-        # 这是训练所需的所有东西
-        sample_pts = {
-            "depth_batch": depth_batch,
-            "pc": pc,
-            "z_vals": z_vals,
-            "indices_b": indices_b,
-            "indices_h": indices_h,
-            "indices_w": indices_w,
-            "dirs_C_sample": dirs_C_sample,
-            "depth_sample": depth_sample,
-            "T_WC_sample": T_WC_sample,
-            "norm_sample": norm_sample,
-            "binary_masks": binary_masks,
-        }
-        return sample_pts
-
-    def sdf_eval_and_loss(
-        self,
-        sample,
-        do_avg_loss=False,
-    ):
-        # [n, 27, 3]
-        pc = sample["pc"]
-        z_vals = sample["z_vals"]
-        indices_b = sample["indices_b"]
-        indices_h = sample["indices_h"]
-        indices_w = sample["indices_w"]
-        dirs_C_sample = sample["dirs_C_sample"]
-        depth_sample = sample["depth_sample"]
-        T_WC_sample = sample["T_WC_sample"]
-        norm_sample = sample["norm_sample"]
-        binary_masks = sample["binary_masks"]
-        depth_batch = sample["depth_batch"]
-        # 首先计算点云真实的sdf上限（如论文所说）[n, 27]和法线[n, 27, 3]
-        bounds, grad_vec = loss.bounds(
-            self.bounds_method,
-            dirs_C_sample,
-            depth_sample,
-            T_WC_sample,
-            z_vals,
-            pc,
-            self.trunc_distance,
-            norm_sample,
-            do_grad=True,
-            scene_file = self.scene_file
-        )
-        # print(len(torch.where(grad_vec[..., 0].isnan())))
-        # print(torch.where(grad_vec[..., 0].isnan()))
-        # print(grad_vec.shape)
-        # grad_vec[torch.where(grad_vec[..., 0].isnan())] =  torch.zeros(3).to(self.device)
-        grad_vec[torch.where(grad_vec[..., 0].isnan())] =  norm_sample[torch.where(grad_vec[..., 0].isnan())[0]]
-        grad_vec = torch.cat((norm_sample, grad_vec.reshape(-1,3)))
-        # 计算这些点云从属于哪个grid，激活这部分grid
-        dist_to_first = pc.reshape(-1,3) - self.grid_pc[0]
-        # 距离放在正常的坐标系下
-        dist_to_first = torch.matmul(self.bounds_transform[:3,:3].inverse(), dist_to_first.T).T
-        
-        dist_to_first = dist_to_first - self.grid_scale/2
-        axis_id_3d = torch.ceil(dist_to_first/self.grid_scale)
-        axis_id = torch.matmul(axis_id_3d , self.idx_mul)
-
-        # outliners = torch.nonzero(axis_id[axis_id >= self.grid_dim**3 ]).shape[0]
-        # if (outliners > 0):
-        #     print("Have outliers :  ",  outliners)
-        # 对于超过场景范围的点不再考虑
-        # out_scene = (axis_id >= self.grid_dim**3)|(axis_id < 0)
-        out_scene = (axis_id_3d[:,0] >= self.grid_dim)|(axis_id_3d[:,0] < 0)|(axis_id_3d[:,1] >= 
-                    self.grid_dim)|(axis_id_3d[:,1] < 0)|(axis_id_3d[:,2] >= self.grid_dim)|(axis_id_3d[:,2] < 0)
-        bounds = bounds.view(-1)[~out_scene]
-        grad_vec = grad_vec.reshape(-1,3)[~out_scene,:]
-        axis_id = axis_id[~out_scene]
-        axis_id = axis_id.long()
-        self.grid_activate[axis_id] = 1
-        weight_old = self.grid_sdf[axis_id, 1]
-        # 使用bound的大小作为权重
-        weight_now = torch.exp(-abs(bounds)*50)
-        weight_now[weight_now<1e-5] = 1e-5
-        # weight_now = 1-abs(bounds)
-        # weight_now[weight_now<0.1] = 0.1
-        # 使用1作为权重
-        # weight_now = torch.ones(bounds.shape).to(self.device)
-        weight_new = weight_old + weight_now
-        # 对这部分grid的sdf进行更新
-        self.grid_sdf[axis_id, 0] = (self.grid_sdf[axis_id, 0] * weight_old + bounds * weight_now)/weight_new
-        # print(self.grid_sdf[axis_id[0], 3:6])
-        # print(weight_old[0])
-        # print(grad_vec.reshape(-1,3)[0])
-        # print(weight_now[0])
-        # print(weight_new[0])
-        # if (weight_old[10]!=0):
-        #     print(self.grid_sdf[axis_id, 0][10])
-        #     print(bounds[10])
-        # print((self.grid_sdf[axis_id[0], 3:6]*weight_old[0]+grad_vec.reshape(-1,3)[0]*weight_now[0])/weight_new[0])
-        self.grid_sdf[axis_id, 3:6] = (self.grid_sdf[axis_id, 3:6] * weight_old[:,None] + grad_vec * weight_now[:,None])/weight_new[:,None]
-        # print(self.grid_sdf[axis_id[0], 3:6])
-        # self.grid_sdf[axis_id, 3:6] = self.grid_sdf[axis_id, 3:6]/(torch.sum(torch.square(self.grid_sdf[axis_id, 3:6]),dim=-1)**(1/2))[:,None]
-        # print(self.grid_sdf[axis_id[0], 3:6])
-        # self.grid_sdf[axis_id, 3:6] = grad_vec.reshape(-1,3)
-        self.grid_sdf[axis_id, 1] = weight_new
-        activate_id = torch.nonzero(self.grid_activate)[:,0]
-        activate_num = activate_id.shape[0]
-        # print("The size of activate voxels is", activate_num)
-        # print(torch.nonzero(self.grid_sdf[activate_id, 2]).shape)
-        # 当前帧的可能要作为sdf计算
-        # 还要再找历史的，历史的就随机选取了，当前grid也能会被抽取到
-        if ( activate_num > self.n_replay_grids ):
-            # 分层采样，分五层，分别采集，如果某层数目不足则全部加入
-            # bin_limits=np.array([-1e99, 0.1, 0.2, 0.5, 1., 1e99])
-            # denom = (self.grid_sdf[activate_id, 2]+0.1).sum()
-            # loss_dist = ( (self.grid_sdf[activate_id, 2]+0.1) / denom).cpu().numpy()
-            # rand_id = torch.tensor(np.random.choice(np.arange(0, activate_num), size = self.n_replay_grids, replace=False, p=loss_dist))
-            rand_id = torch.randint(0, activate_num, (self.n_replay_grids,))
-        else:
-            rand_id = torch.arange(0, activate_num)
-        # 转为真正的索引
-        rand_id = torch.cat((axis_id, activate_id[rand_id].to(self.device)))
-        grid_usd =  self.grid_pc[rand_id]
-        # print(grid_usd.shape)
-        # eik公式的损失权重和grad发现的损失权重如果不是0，就需要计算梯度
-        do_sdf_grad = self.eik_weight != 0 or self.grad_weight != 0
-        # debug使用，展示点云
-        self.grid_points = grid_usd.cpu().numpy()
-        if do_sdf_grad:
-            # 需要为张量计算梯度
-            grid_usd.requires_grad_()
-        # 把这些点云输入网络中，得到sdf值，这是输出加上噪声然后又缩放的结果
-        sdf = self.sdf_map(grid_usd, noise_std=self.noise_std)
-        # 求取误差
-        sdf_grad = None
-        if do_sdf_grad:
-            # 利用这些采样点，和对应的sdf，计算对当前网络输出的法线，也是[n,27,3]，是在每个点的三维方向
-            sdf_grad = fc_map.gradient(grid_usd, sdf)
-        # 计算sdf损失，trunc_distance用来判断是不是表面点，论文中有，free和surf的sdf计算方式还不一样，得到[n, 27]的损失
-        sdf_loss_mat, free_space_ixs = loss.sdf_loss(sdf, self.grid_sdf[rand_id, 0], self.trunc_distance, loss_type=self.loss_type)
-        # 计算eik的损失，就是看预测的grad法向量是不是1
-        eik_loss_mat = None
-        if self.eik_weight != 0:
-            eik_loss_mat = torch.abs(sdf_grad.norm(2, dim=-1) - 1)
-        # 计算grad的损失
-        grad_loss_mat = None
-        if self.grad_weight != 0:
-            # 首先计算预测的表面点的loss，再计算不是表面的。因为表面的可以用深度图像估计的法线
-            # 法向量
-            # pred_norms = sdf_grad[:, 0]
-            # # 损失计算方式和论文相同
-            # surf_loss_mat = 1 - self.cosSim(pred_norms, norm_sample)
-            # # 对于计算的预测梯度是nan的，直接认为它是真值
-            # grad_vec[torch.where(grad_vec[..., 0].isnan())] =  norm_sample[torch.where(grad_vec[..., 0].isnan())[0]]
-            # # 计算不是表面的梯度
-            # grad_loss_mat = 1 - self.cosSim(grad_vec, sdf_grad[:, 1:])
-            # # 把两者叠加起来
-            # grad_loss_mat = torch.cat((surf_loss_mat[:, None], grad_loss_mat), dim=1)
-            # 计算grad损失就是我们认为的真值和sdf
-            grad_loss_mat = 1 - self.cosSim(self.grid_sdf[rand_id, 3:6], sdf_grad )
-            if self.orien_loss:
-                grad_loss_mat = (grad_loss_mat > 1).float()
-        # 计算总体损失，total_loss为最终平均值，total_loss_mat为每个点的值，losses为一个类，用来终端打印
-        total_loss, total_loss_mat, losses = loss.tot_loss(
-            sdf_loss_mat, grad_loss_mat, eik_loss_mat,
-            free_space_ixs, self.grid_sdf[rand_id, 0], self.eik_apply_dist,
-            self.trunc_weight, self.grad_weight, self.eik_weight,
-        )
-        self.grid_sdf[rand_id, 2] = total_loss_mat.detach()
-        loss_approx, frame_avg_loss = None, None
-        if do_avg_loss:
-            # 需要计算分块的损失loss_approx，和分帧的损失frame_avg_loss
-            loss_approx, frame_avg_loss = loss.frame_avg(total_loss_mat, depth_batch, indices_b, indices_h, indices_w,
-                self.W, self.H, self.loss_approx_factor, binary_masks)
-        # 返回这一训练批次的总loss，需要发布的loss类，分块的loss[n_used_kf, 8, 8]，分帧的loss[n_used_kf]
-        return (
-            total_loss,
-            losses,
-            loss_approx,
-            frame_avg_loss,
-        )
-
-    def step(self):
-        # 处理一次迭代的主要函数，计算loss
-        start, end = start_timing()
-        # 所有的关键帧的数据
-        depth_batch = self.frames.depth_batch
-        T_WC_batch = self.frames.T_WC_batch
-        # dyndyn：需要使用到frames的score
-        score_batch = self.frames.score_batch if self.do_normal else None
-        norm_batch = self.frames.normal_batch if self.do_normal else None
-        
-        n_frames = len(self.frames)
-        idxs = [n_frames-1]
-        # 这些是选取出来进行训练的图像和轨迹数据
-        depth_batch = depth_batch[idxs]
-        score_batch = score_batch[idxs]
-        T_WC_select = T_WC_batch[idxs]
-        # dyndyn：新的采样策略，是用score来确定
-        # 在其中采样点，得到世界坐标系下的点云，已经是所有的训练数据了
-        sample_pts = self.sample_points(depth_batch, T_WC_select, norm_batch=norm_batch, score_batch=score_batch)
-        # 原方法
-        # sample_pts = self.sample_points(depth_batch, T_WC_select, norm_batch=norm_batch)
-        # 计算sdf值和loss值，没有使用分块损失，直接随机采样点 
-        # dyndyn：不计算分帧的loss
-        total_loss, losses, active_loss_approx, frame_avg_loss =  self.sdf_eval_and_loss(sample_pts, do_avg_loss=False)
-        # 得到现在这个网络在目前关键帧上的loss，作为下一次选取关键帧的依据
-        # self.frames.frame_avg_losses[idxs] = frame_avg_loss
-        # 使用总loss反向传播，计算每个值的梯度
-        total_loss.backward()
-        # 优化器对参数进行优化
-        self.optimiser.step()
-
-        # total_params = sum(p.numel() for p in self.sdf_map.parameters())
-        # total_params += sum(p.numel() for p in self.sdf_map.buffers())
-        # print(f'{total_params:,} total parameters.')
-        # print(f'{total_params/(1024*1024):.2f}M total parameters.')
-
-        for param_group in self.optimiser.param_groups:
-            params = param_group["params"]
-            for param in params:
-                # 得到了参数的梯度
-                # torch.Size([256, 255])
-                # torch.Size([256])
-                # torch.Size([256, 256])
-                # torch.Size([256])
-                # torch.Size([256, 256])
-                # torch.Size([256])
-                # torch.Size([256, 511])
-                # torch.Size([256])
-                # torch.Size([256, 256])
-                # torch.Size([256])
-                # torch.Size([256, 256])
-                # torch.Size([256])
-                # torch.Size([1, 256])
-                # torch.Size([1])
-                param.grad = None
-        # 记录现在时间
-        step_time = end_timing(start, end)
-        time_s = step_time / 1000.
-        # 模拟速度为1，所以总时间就是加上花费的真实时间
-        self.tot_step_time += (1 / self.frac_time_perception) * time_s
-        # 处理的帧数加一
-        self.steps_since_frame += 1
-        return losses, step_time
 
     # Visualisation methods -----------------------------------
 
@@ -1319,19 +841,20 @@ class Trainer():
         # for i in range(sdf_mesh.faces.shape[0]):
         #     sdf_mesh.visual.face_colors[i] = 255*np.array([face_normals[i,0],face_normals[i,1],face_normals[i,2],1])
             
-        # 方法二：按照面中心高度着色
-        face_vertices = sdf_mesh.vertices[sdf_mesh.faces].mean(axis=1)
-        # 对于replica数据集
-        face_z = face_vertices[:,1]
-        # 对于scannet数据集
-        if self.dataset_format == "ScanNet":
-            face_z = face_vertices[:,2]
-        cmap = sdf_util.get_cost_colormap(range=[face_z.min(),face_z.max()])
-        face_rgba = cmap.to_rgba(face_z.flatten(), alpha=1., bytes=False)
-        for i in range(sdf_mesh.faces.shape[0]):
-            sdf_mesh.visual.face_colors[i] = 255*face_rgba[i]
-
+        if "gt_mesh_dir" not in self.config["dataset"]:
+            # 方法二：按照面中心高度着色
+            face_vertices = sdf_mesh.vertices[sdf_mesh.faces].mean(axis=1)
+            # 对于replica数据集
+            face_z = face_vertices[:,1]
+            # 对于scannet数据集
+            if self.dataset_format == "ScanNet":
+                face_z = face_vertices[:,2]
+            cmap = sdf_util.get_cost_colormap(range=[face_z.min(),face_z.max()])
+            face_rgba = cmap.to_rgba(face_z.flatten(), alpha=1., bytes=False)
+            for i in range(sdf_mesh.faces.shape[0]):
+                sdf_mesh.visual.face_colors[i] = 255*face_rgba[i]
         return sdf_mesh
+
 
     def mesh_local_rec(self):
         """
@@ -1346,16 +869,33 @@ class Trainer():
         grid_activate = self.grid_activate.reshape(self.grid_dim,self.grid_dim,self.grid_dim)
         grid_activate = grid_activate == 1
         sdf[grid_activate] = sdf_local[grid_activate]
-        # bounds_transform_np帮助把转换到原点，scene_scale_np帮助变换到正常场景大小
+
+        # N = sdf_local.shape[0]
+        # coords = torch.stack(torch.meshgrid(torch.arange(N), torch.arange(N), torch.arange(N)), dim=-1)
+        # distance_map, nearest_indices = distance_transform_edt(~grid_activate.cpu().numpy(), return_indices=True)
+        # print(nearest_indices)
+        # nearest_indices = torch.tensor(nearest_indices, dtype=torch.long, device="cuda")
+        # nearest_values = sdf_local[tuple(nearest_indices)][~grid_activate]
+        # filled_tensor = sdf_local.clone()
+        # # filled_tensor[~grid_activate] = sdf_local[tuple(nearest_indices)]
+        # filled_tensor[~grid_activate] = nearest_values
+        # sdf_mesh = draw3D.draw_mesh(filled_tensor,  self.scene_scale_np, self.bounds_transform_np,)
         sdf_mesh = draw3D.draw_mesh(sdf,  self.scene_scale_np, self.bounds_transform_np, grid_activate,)
+        # sdf_mesh = draw3D.draw_mesh(sdf,  self.scene_scale_np, self.bounds_transform_np,)
         return sdf_mesh
 
-    def write_mesh(self, filename, im_pose=None):
+    def write_mesh(self, filename, save_local = False, im_pose=None):
         mesh = self.mesh_rec()
         data = trimesh.exchange.ply.export_ply(mesh)
         out = open(filename, "wb+")
         out.write(data)
         out.close()
+        if save_local:
+            mesh = self.mesh_local_rec()
+            data = trimesh.exchange.ply.export_ply(mesh)
+            out = open(filename+"_local.ply", "wb+")
+            out.write(data)
+            out.close()
         if im_pose is not None:
             scene = trimesh.Scene(mesh)
             im = draw3D.capture_scene_im(
@@ -1542,24 +1082,31 @@ class Trainer():
                     slices["gt_cost"][s][..., ::-1])
 
     def slices_vis(self, n_slices=6):
+        include_gt = True
+        if self.myself:
+            include_gt = False
         # 计算切片可视化
         slices = self.compute_slices(
             z_ixs=None,
             n_slices=n_slices,
-            include_gt=True,
+            include_gt=include_gt,
             include_diff=False,
             include_chomp=False,
             draw_cams=False,
         )
-        # 切片可视化
-        gt_sdf = np.hstack((slices["gt_sdf"]))
-        # gt_cost = np.hstack((slices["gt_cost"]))
-        pred_sdf = np.hstack((slices["pred_sdf"]))
-        viz = np.vstack((gt_sdf, pred_sdf))
-        # pred_cost = np.hstack((slices["pred_cost"]))
-        # diff = np.hstack((slices["diff"]))
-        # viz = np.vstack((gt_sdf, pred_sdf, diff))
-        # viz = np.vstack((gt_sdf, gt_cost, pred_sdf, pred_cost, diff))
+        if self.myself:
+            pred_sdf = np.hstack((slices["pred_sdf"]))
+            viz = pred_sdf
+        else:
+            # 切片可视化
+            gt_sdf = np.hstack((slices["gt_sdf"]))
+            # gt_cost = np.hstack((slices["gt_cost"]))
+            pred_sdf = np.hstack((slices["pred_sdf"]))
+            viz = np.vstack((gt_sdf, pred_sdf))
+            # pred_cost = np.hstack((slices["pred_cost"]))
+            # diff = np.hstack((slices["diff"]))
+            # viz = np.vstack((gt_sdf, pred_sdf, diff))
+            # viz = np.vstack((gt_sdf, gt_cost, pred_sdf, pred_cost, diff))
         return viz
 
     def to_topdown(self, pts, im_size):
@@ -1691,16 +1238,16 @@ class Trainer():
             n_strat_samples=1, n_surf_samples=0)
         pc = sample_pts["pc"]
 
-        # 只考虑在场景范围内的点
-        dist_to_first = pc.reshape(-1,3) - self.grid_pc[0]
-        dist_to_first = torch.matmul(self.bounds_transform[:3,:3].inverse(), dist_to_first.T).T
-        dist_to_first = dist_to_first - self.grid_scale/2
-        axis_id_3d = torch.ceil(dist_to_first/self.grid_scale)
-        out_scene = (axis_id_3d[:,0] >= self.grid_dim-1)|(axis_id_3d[:,0] <= 0)|(axis_id_3d[:,1] >= 
-                    self.grid_dim-1)|(axis_id_3d[:,1] <= 0)|(axis_id_3d[:,2] >= self.grid_dim-1)|(axis_id_3d[:,2] <= 0)
-        # print(pc.shape)
-        pc = pc[~out_scene]
-        # print(pc.shape)
+        # # 只考虑在场景范围内的点
+        # dist_to_first = pc.reshape(-1,3) - self.grid_pc[0]
+        # dist_to_first = torch.matmul(self.bounds_transform[:3,:3].inverse(), dist_to_first.T).T
+        # dist_to_first = dist_to_first - self.grid_scale/2
+        # axis_id_3d = torch.ceil(dist_to_first/self.grid_scale)
+        # out_scene = (axis_id_3d[:,0] >= self.grid_dim-1)|(axis_id_3d[:,0] <= 0)|(axis_id_3d[:,1] >= 
+        #             self.grid_dim-1)|(axis_id_3d[:,1] <= 0)|(axis_id_3d[:,2] >= self.grid_dim-1)|(axis_id_3d[:,2] <= 0)
+        # # print(pc.shape)
+        # pc = pc[~out_scene]
+        # # print(pc.shape)
         
 
         with torch.set_grad_enabled(False):
@@ -1836,3 +1383,650 @@ class Trainer():
             self.gt_sdf_interp, self.eval_pts_root,
             len(self.scene_dataset), grad_fn=self.grad_fn,
         )
+
+
+
+    # Data methods ---------------------------------------
+
+    def load_data(self):
+        # 图像预处理
+        rgb_transform = transforms.Compose(
+            [image_transforms.BGRtoRGB()])
+        depth_transform = transforms.Compose(
+            [image_transforms.DepthScale(self.inv_depth_scale),
+             image_transforms.DepthFilter(self.max_depth)])
+        if self.dataset_format == "ScanNet":
+            dataset_class = dataset.ScanNetDataset
+            col_ext = ".jpg"
+            self.up = np.array([0., 0., 1.])
+            ims_file = self.scannet_dir
+        elif self.dataset_format == "replica":
+            dataset_class = dataset.ReplicaDataset
+            col_ext = ".jpg"
+            self.up = np.array([0., 1., 0.])
+            ims_file = self.ims_file
+        elif self.dataset_format == "replicaCAD":
+            dataset_class = dataset.ReplicaDataset
+            col_ext = ".png"
+            # 图像到俯视图需要进行的变换
+            self.up = np.array([0., 1., 0.])
+            ims_file = self.ims_file
+        # 数据集的类
+        self.scene_dataset = dataset_class(
+            ims_file,
+            self.traj_file,
+            rgb_transform=rgb_transform,
+            depth_transform=depth_transform,
+            col_ext=col_ext,
+            noisy_depth=self.noisy_depth,
+        )
+        if self.incremental is False:
+            # 如果不是增量式的话，要自己构建索引
+            if "im_indices" not in self.config["dataset"]:
+                if "n_random_views" in self.config["dataset"]:
+                    n_random_views = self.config["dataset"]["n_random_views"]
+                    if n_random_views > 0:
+                        n_dataset = len(self.scene_dataset)
+                        self.indices = np.random.choice(
+                            np.arange(0, n_dataset),
+                            size=n_random_views,
+                            replace=False)
+            print("Frame indices", self.indices)
+            idxs = self.indices
+            frame_data = self.get_data(idxs)
+            self.add_data(frame_data)
+
+    def get_data(self, idxs):
+        # 获取某帧数据的数据类，用于把数据都加载进来
+        frames_data = FrameData()
+        for idx in idxs:
+            # 返回rgb和深度图像的矩阵信息，以及pose
+            sample = self.scene_dataset[idx]
+            im_np = sample["image"][None, ...]
+            depth_np = sample["depth"][None, ...]
+            T_np = sample["T"][None, ...]
+            # rgb图像归一化了一下
+            im = torch.from_numpy(im_np).float().to(self.device) / 255.
+            depth = torch.from_numpy(depth_np).float().to(self.device)
+            T = torch.from_numpy(T_np).float().to(self.device)
+            # 一个数据操作的类
+            data = FrameData(
+                frame_id=np.array([idx]),
+                im_batch=im,
+                im_batch_np=im_np,
+                depth_batch=depth,
+                depth_batch_np=depth_np,
+                T_WC_batch=T,
+                T_WC_batch_np=T_np,
+            )
+            if self.do_normal:
+                # 需要计算法线，是需要的，得到整个点云，为点云计算法线，得到每个点的法线
+                pc = geometry.transform.pointcloud_from_depth_torch(depth[0], self.fx, self.fy, self.cx, self.cy)
+                normals = geometry.transform.estimate_pointcloud_normals(pc)
+                normals = geometry.transform.adjust_normals_outward(normals, pc, T[0])
+                data.normal_batch = normals[None, :]
+                # dyndyn：计算渲染和深度的得分
+                # 渲染得分
+                normals_render = torch.sum(self.dirs_C[0] * normals, axis = 2)
+                normal_block = normals_render.view(self.loss_approx_factor, self.h_block, self.loss_approx_factor, self.w_block)
+                normal_loss = normal_block.var(dim=(1,3))
+                normal_loss[torch.isnan(normal_loss) ] = 0.
+                normal_loss = (normal_loss-normal_loss.min())/(normal_loss.max()-normal_loss.min())  
+                # 深度得分
+                depth_block = depth.view(self.loss_approx_factor, self.h_block, self.loss_approx_factor, self.w_block)
+                depth_loss = depth_block.var(dim=(1,3))
+                depth_loss = (depth_loss-depth_loss.min())/(depth_loss.max()-depth_loss.min())  
+                # 总得分并归一化
+                all_loss = 0.3 * normal_loss + 0.7 * depth_loss
+                scores = all_loss / all_loss.sum()
+                data.score_batch = scores[None, :]
+            if self.gt_traj is not None:
+                # 如果有真正的轨迹的话，其实用的不是真值
+                data.T_WC_gt = self.gt_traj[idx][None, ...]
+            # 添加数据，一定不是替换最后一个，因为这是一个空的数据类型
+            frames_data.add_frame_data(data, False)
+        return frames_data
+
+    def add_data(self, data):
+        # 新的时刻添加新的数据进行，如果最后一帧不是关键帧，则新帧将替换批次中的最后一帧
+        self.frames.add_frame_data(data, True)
+
+    def add_frame(self, frame_data):
+        # 如果不管上一帧率是不是关键帧，都要计算新的帧的loss
+        self.frozen_sdf_map = copy.deepcopy(self.sdf_map)
+        # 添加数据进去
+        self.add_data(frame_data)
+        self.steps_since_frame = 0
+        self.last_is_keyframe = False
+        self.optim_frames = self.iters_per_frame
+        self.noise_std = self.noise_frame
+        self.rand_id_ok = None
+
+    # Keyframe methods ----------------------------------
+
+    # def is_keyframe(self, T_WC, depth_gt):
+    #     # 判断某一帧是否为关键帧
+    #     # 对其进行采样
+    #     sample_pts = self.sample_points(depth_gt, T_WC, n_rays=self.n_rays_is_kf, dist_behind_surf=0.8)
+    #     pc = sample_pts["pc"]
+    #     z_vals = sample_pts["z_vals"]
+    #     depth_sample = sample_pts["depth_sample"]
+    #     #评估采样点的sdf
+    #     with torch.set_grad_enabled(False):
+    #         # 把添加了关键帧之后的模型冷冻一下，作为判断是否需要添加新的关键帧的依据
+    #         sdf = self.frozen_sdf_map(pc, noise_std=self.noise_std)
+    #     z_vals, ind1 = z_vals.sort(dim=-1)
+    #     ind0 = torch.arange(z_vals.shape[0])[:, None].repeat(1, z_vals.shape[1])
+    #     # sdf安装z_vals排了一下序, 但数目有限
+    #     sdf = sdf[ind0, ind1]
+    #     # 利用预测的sdf渲染图像，但只能得到光线位置的渲染 n x 27
+    #     view_depth = render.sdf_render_depth(z_vals, sdf)
+    #     # 计算渲染得到的图像与真值图像的采样位置的误差
+    #     loss = torch.abs(view_depth - depth_sample) / depth_sample
+    #     # 判断有哪些采样光线的loss低于设置的损失阈值
+    #     below_th = loss < self.kf_dist_th
+    #     size_loss = below_th.shape[0]
+    #     # loss较低的像素占比有多少
+    #     below_th_prop = below_th.sum().float() / size_loss
+    #     # 如果loss较低的比较少，也就是loss差异较大的比较多，那就是关键帧
+    #     is_keyframe = below_th_prop.item() < self.kf_pixel_ratio
+    #     # # 给出当前帧是否应该作为关键帧的依据
+    #     # print(
+    #     #     "Proportion of loss below threshold",
+    #     #     below_th_prop.item(),
+    #     #     "for KF should be less than",
+    #     #     self.kf_pixel_ratio,
+    #     #     ". Therefore is keyframe:",
+    #     #     is_keyframe
+    #     # )
+    #     return is_keyframe
+
+    # def check_keyframe_latest(self):
+    #     """
+    #     returns whether or not to add a new frame.
+    #     返回是否需要添加一个新的帧进来
+    #     """
+    #     add_new_frame = False
+    #     if self.last_is_keyframe:
+    #         # 如果已经是关键帧，就不要在设定这是关键帧了
+    #         add_new_frame = True
+    #     else:
+    #         # Check if latest frame should be a keyframe.
+    #         # 检查最新帧是否应为关键帧。
+    #         T_WC = self.frames.T_WC_batch[-1].unsqueeze(0)
+    #         depth_gt = self.frames.depth_batch[-1].unsqueeze(0)
+    #         # 判断最新帧是否为关键帧
+    #         self.last_is_keyframe = self.is_keyframe(T_WC, depth_gt)
+    #         # 如果是关键帧的话，要把优化次数纠正一下
+    #         if self.last_is_keyframe:
+    #             self.optim_frames = self.iters_per_kf
+    #             # 噪声，不是很懂
+    #             self.noise_std = self.noise_kf
+    #         else:
+    #             add_new_frame = True
+    #     return add_new_frame
+
+
+    # Main training methods ----------------------------------
+
+    
+    def sample_points(
+        self,
+        depth_batch,
+        T_WC_batch,
+        norm_batch=None,
+        score_batch=None,
+        active_loss_approx=None,
+        n_rays=None,
+        dist_behind_surf=None,
+        n_strat_samples=None,
+        n_surf_samples=None,
+    ):
+        # 得到所有的采样数据，用于训练
+        # 首先采样像素，然后沿反向投影光线采样深度，从而采样点。
+        if n_rays is None:
+            # 采样的光线数量
+            n_rays = self.n_rays
+        if dist_behind_surf is None:
+            # 考虑的障碍物后面的距离
+            dist_behind_surf = self.dist_behind_surf
+        if n_strat_samples is None:
+            # 均匀采样的个数
+            n_strat_samples = self.n_strat_samples
+        if n_surf_samples is None:
+            # 高斯采样的个数
+            n_surf_samples = self.n_surf_samples
+        # 这一批次用来训练的图像个数
+        n_frames = depth_batch.shape[0]
+        if active_loss_approx is None:
+            # 获取采样点的像素
+            if score_batch is not None:
+                # indices_b, indices_h, indices_w = sample.sample_pixels( n_rays, n_frames, self.H, self.W, device=self.device)
+                indices_b, indices_h, indices_w = sample.sample_pixels_score(score_batch, n_rays, n_frames, self.H, self.W, self.h_block, self.w_block, self.loss_approx_factor, self.c, self.r,  device=self.device)
+            else:
+                indices_b, indices_h, indices_w = sample.sample_pixels( n_rays, n_frames, self.H, self.W, device=self.device)
+        else:
+            raise Exception('Active sampling not currently supported.')
+
+        # 上面只是得到采样像素，还要得到采样光线，对深度为0的采样点过滤，并获得了光线方向dirs_C_sample
+        get_masks = active_loss_approx is None
+        (
+            dirs_C_sample,
+            depth_sample,
+            norm_sample,
+            T_WC_sample,
+            binary_masks,
+            indices_b,
+            indices_h,
+            indices_w
+        ) = sample.get_batch_data(
+            depth_batch,
+            T_WC_batch,
+            self.dirs_C,
+            indices_b,
+            indices_h,
+            indices_w,
+            norm_batch=norm_batch,
+            get_masks=get_masks,
+        )
+
+        # 最大深度，为真实深度基础上加上高斯采样的范围
+        max_depth = depth_sample + dist_behind_surf
+        # 还要在光线上采样，得到了世界坐标下的点云数据
+        pc, z_vals, pc_surf, z_vals_surf = sample.sample_along_rays(
+            T_WC_sample,
+            self.min_depth,
+            max_depth,
+            n_strat_samples,
+            n_surf_samples,
+            dirs_C_sample,
+            gt_depth=depth_sample,
+            grad=False,
+        )
+        # 这是训练所需的所有东西
+        sample_pts = {
+            "depth_batch": depth_batch,
+            "pc": pc,
+            "z_vals": z_vals,
+            "indices_b": indices_b,
+            "indices_h": indices_h,
+            "indices_w": indices_w,
+            "dirs_C_sample": dirs_C_sample,
+            "depth_sample": depth_sample,
+            "T_WC_sample": T_WC_sample,
+            "norm_sample": norm_sample,
+            "binary_masks": binary_masks,
+        }
+        return sample_pts
+    
+
+    def find_visable_grids(self, depth, grid_pcs, w2c, down=5):
+        if_time = False
+        if if_time:
+            start_time = time.time()
+        '''
+        输入深度图像和图像的全局姿态，返回可见的栅格，并生成当前帧的点云
+        '''
+        # 1. 生成栅格的索引
+        grid_pcs_h = torch.cat([grid_pcs, torch.ones(grid_pcs.shape[0], 1, device='cuda')], dim=1)
+        if if_time:
+            end_time = time.time()
+            print("The gen time is", end_time-start_time)
+            start_time = time.time()
+        # 2. 将世界坐标系的点转换为相机坐标系
+        cam_points = (w2c @ grid_pcs_h.T).T
+        img_points = (self.k @ cam_points[:, :3].T).T
+        img_points = img_points[:, :2] / img_points[:, 2:]
+        # 3. 保留在图像范围内的点
+        valid_mask = (img_points[:, 0] >= 0) & (img_points[:, 0] < self.W) & (img_points[:, 1] >= 0) & (img_points[:, 1] < self.H)
+        valid_img_points = img_points[valid_mask]
+        valid_cam_points = cam_points[valid_mask]
+        valid_all_grid_indices = self.all_grid_indices[valid_mask]
+        if if_time:
+            end_time = time.time()
+            print("The ima time is", end_time-start_time)
+            start_time = time.time()
+        # 4. 根据像素位置提取深度值
+        pixel_x = valid_img_points[:, 0].long()
+        pixel_y = valid_img_points[:, 1].long()
+        depth_values = depth[pixel_y, pixel_x]
+        if if_time:
+            end_time = time.time()
+            print("The depth time is", end_time-start_time)
+            start_time = time.time()
+        # 5. 生成完整的点云（当前帧），仅保留深度值 > 0 的像素
+        valid_depth_mask = depth > 0
+        valid_depth_mask = valid_depth_mask[::down, ::down]
+        u, v = torch.meshgrid(torch.arange(0, self.H, down, device='cuda'), torch.arange(0, self.W, down, device='cuda'), indexing='ij')
+        u = u[valid_depth_mask].float()
+        v = v[valid_depth_mask].float()
+        depth_valid = depth[::down, ::down][valid_depth_mask]  # 过滤掉深度为 0 的像素
+        # 将有效深度像素转换为相机坐标
+        x = (v - self.cx) * depth_valid / self.fx
+        y = (u - self.cy) * depth_valid / self.fy
+        z = depth_valid
+        current_frame_pcd = torch.stack((x, y, z), dim=-1)  # 点云 (有效像素数量, 3)
+        current_frame_pcd_h = torch.cat([current_frame_pcd, torch.ones(current_frame_pcd.shape[0], 1, device='cuda')], dim=1)  # 增加齐次坐标
+        current_frame_pcd = (w2c.inverse() @ current_frame_pcd_h.T).T[:, :3]  # 转换到世界坐标系
+        if if_time:
+            end_time = time.time()
+            print("The current time is", end_time-start_time)
+            start_time = time.time()
+        # 6. 判断哪些点满足深度范围
+        point_depths = valid_cam_points[:, 2]
+        valid_depth_mask = (point_depths > 0) & (point_depths < (depth_values + self.dist_behind_surf))  & (depth_values>0)
+        valid_all_grid_indices = valid_all_grid_indices[valid_depth_mask]
+        # 在后面的部分给出索引，是在所有可视栅格的索引
+        behind_index = point_depths[valid_depth_mask] > depth_values[valid_depth_mask]
+        # near_face_index = abs(point_depths[valid_depth_mask] - depth_values[valid_depth_mask]) < self.trunc_distance
+        near_face_index = abs(point_depths[valid_depth_mask] - depth_values[valid_depth_mask]) < 0.1
+        if if_time:
+            end_time = time.time()
+            print("The near time is", end_time-start_time)
+            start_time = time.time()
+        # 返回可见栅格索引、可见点云、以及根据深度图像生成的当前帧的点云
+        return valid_all_grid_indices, grid_pcs[valid_all_grid_indices], behind_index, near_face_index, current_frame_pcd, u.long(), v.long()
+
+    def compute_local_variance(self, gradient_field, valid_mask, window_size=3):
+        padding = window_size // 2
+        # 0. 梯度归一化
+        norm = torch.norm(gradient_field, dim=-1, keepdim=True)  # 计算每个点的L2范数
+        gradient_field = torch.where(norm > 0, gradient_field / norm, torch.zeros_like(gradient_field))
+        # 1. 计算局部均值，首先对无效梯度进行掩码处理
+        masked_gradients = gradient_field * valid_mask.unsqueeze(-1)  # (N, N, N, 3)
+        # 检查 masked_gradients 的维度
+        if masked_gradients.shape[0] == 0 or masked_gradients.shape[1] == 0 or masked_gradients.shape[2] == 0:
+            raise ValueError("Masked gradients are empty.")
+        # 2. 计算有效梯度的局部均值
+        masked_gradients = masked_gradients.permute(3, 0, 1, 2).unsqueeze(0)  # (1, 3, N, N, N)
+        # 2. 计算局部均值，只考虑有效值
+        local_sum = F.avg_pool3d(masked_gradients, 
+                                kernel_size=window_size, 
+                                stride=1, 
+                                padding=padding)
+        valid_count = F.avg_pool3d(valid_mask.unsqueeze(0).unsqueeze(0).float(), 
+                                kernel_size=window_size, 
+                                stride=1, 
+                                padding=padding) + 1e-8  # 避免除零
+        # local_mean = local_sum / valid_count  # 只对有效值计算均值
+        local_mean = local_sum
+        # 3. 计算局部方差
+        squared_diff = (masked_gradients - local_mean) ** 2
+        local_variance_sum = F.avg_pool3d(squared_diff, 
+                                        kernel_size=window_size, 
+                                        stride=1, 
+                                        padding=padding)
+        local_variance = local_variance_sum / valid_count  # 根据有效值数量归一化
+        # 最终返回局部方差，去掉多余的维度
+        var_value = torch.mean(local_variance.squeeze(0), dim=0)
+        var_value = var_value.flatten()
+        return var_value
+
+
+    def sdf_eval_and_loss_new(
+        self,
+        depth_this,
+        T_WC_this,
+        t,
+        norm_this=None,
+        score_this=None,
+        active_loss_approx=None,
+        n_rays=None,
+        dist_behind_surf=None,
+        n_strat_samples=None,
+        n_surf_samples=None,
+        rand_id=None
+    ):
+        if_time = False
+        if if_time:
+            start_time = time.time()
+
+        if rand_id is None:
+            visable_index, visable_grids, behind_index, near_face_index, gt_pc, gt_pc_pixel_u,  gt_pc_pixel_v= self.find_visable_grids(depth_this, self.grid_pc, T_WC_this.inverse(),down=2)
+            if self.all_gt_pc is not None:
+                self.all_gt_pc = torch.cat((self.all_gt_pc, gt_pc))
+            else:
+                self.all_gt_pc = gt_pc
+            if if_time:
+                end_time = time.time()
+                print("The find visable time is", end_time-start_time)
+                start_time = time.time()
+            # 本来就是顺序分布的，直接降采样即可
+            # visable_index = visable_index[::300]
+            # visable_grids = visable_grids[::300]
+            # behind_index = behind_index[::300]
+            # visable_index = torch.cat([visable_index[~near_face_index][::500], visable_index[near_face_index][::50]], dim=0)
+            # visable_grids = torch.cat([visable_grids[~near_face_index][::500], visable_grids[near_face_index][::50]], dim=0)
+            # behind_index = torch.cat([behind_index[~near_face_index][::500], behind_index[near_face_index][::50]], dim=0)
+            visable_index = torch.cat([visable_index[~near_face_index][::500], visable_index[near_face_index][::50]], dim=0)
+            visable_grids = torch.cat([visable_grids[~near_face_index][::500], visable_grids[near_face_index][::50]], dim=0)
+            behind_index = torch.cat([behind_index[~near_face_index][::500], behind_index[near_face_index][::50]], dim=0)
+            
+            # 使用所有的栅格和所有的点云太多了
+            diff = visable_grids[:, None, :] - gt_pc[None, :, :]  # M x N x 3
+            dists = diff.norm(p=2, dim=-1)  # 计算欧几里得距离 M x N
+            dists, closest_ixs = dists.min(dim=-1)  # 对每个 visable_grid 找到最近的 gt_pc，返回最小距离和索引
+            dists[behind_index] *= -1  # 对 behind_index 中的点，将距离标记为负数
+        
+            # 计算方向向量，但这样计算出来的梯度其实在空闲区域是不准确的
+            # directions = gt_pc[closest_ixs] - visable_grids  # M x 3
+            directions = visable_grids - gt_pc[closest_ixs]  # M x 3
+            eps = 1e-8  # 避免除以零
+            this_grad = directions / (torch.norm(directions, dim=1, keepdim=True) + eps)  # 单位方向向量
+            this_grad[behind_index] *= -1  
+            
+            if if_time:
+                end_time = time.time()
+                print("The cal time is", end_time-start_time)
+                start_time = time.time()
+
+            self.grid_activate[visable_index] = 1
+            weight_old = self.grid_sdf[visable_index, 1]
+            # 使用bound的大小作为权重
+            weight_now = torch.exp(-abs(dists)*5)
+            weight_now[weight_now<1e-3] = 1e-3
+            # weight_now = 1-abs(bounds)
+            # weight_now[weight_now<0.1] = 0.1
+            # 使用1作为权重
+            # weight_now = torch.ones(bounds.shape).to(self.device)
+            weight_new = weight_old + weight_now
+            # 对这部分grid的sdf进行更新
+            visable_index_old_sdf = self.grid_sdf[visable_index, 0]
+            
+            # self.grid_sdf[visable_index, 0] = (self.grid_sdf[visable_index, 0] * weight_old + dists * weight_now)/weight_new
+            # self.grid_sdf[visable_index, 3:6] = (self.grid_sdf[visable_index, 3:6] * weight_old[:,None] + this_grad * weight_now[:,None])/weight_new[:,None]
+            # self.grid_sdf[visable_index, 1] = weight_new
+            
+            # 消融实验，不更新
+            self.grid_sdf[visable_index, 0] = torch.where(
+                weight_old > 0,  self.grid_sdf[visable_index, 0], dists  # 当 weight_old == 0 时，使用最新值 dists
+            )
+            self.grid_sdf[visable_index, 3:6] = torch.where(
+                weight_old[:, None] > 0, self.grid_sdf[visable_index, 3:6],  this_grad  # 当 weight_old == 0 时，使用最新的 this_grad
+            )
+            self.grid_sdf[visable_index, 1] = torch.where(
+                weight_old > 0,  weight_old, weight_new   # 使用最新值
+            )
+            
+            visable_index_new_sdf = self.grid_sdf[visable_index, 0]
+            
+            if if_time:
+                end_time = time.time()
+                print("The fusion time is", end_time-start_time)
+                start_time = time.time()
+
+            # 对于当前帧，只引入变化大的
+            visable_index_change = visable_index[abs(visable_index_old_sdf-visable_index_new_sdf)>0.005]
+            activate_id = torch.nonzero(self.grid_activate)[:,0]
+            # near_face = (self.grid_sdf[:,0] < self.trunc_distance) & (self.grid_activate>0)
+            near_face = (self.grid_sdf[:,0] < 0.1) & (self.grid_activate>0)
+            # surface_id = torch.nonzero(near_face.bool(), as_tuple=False)[:,0]
+            # 计算梯度局部变化大的区域，一般是复杂的薄几何和精细物体
+            local_variance = self.compute_local_variance(self.grid_sdf[:, 3:6].reshape(self.grid_dim,self.grid_dim,self.grid_dim,-1),
+                                                                     self.grid_activate.reshape(self.grid_dim,self.grid_dim,self.grid_dim),window_size=7)
+            activated_values = local_variance[near_face]  # 提取被激活的值
+            threshold_index = int(len(activated_values) * 0.2)  # 前面一些的索引
+            if threshold_index == 0:
+                raise ValueError("No activated values to process.")
+            sorted_values, sorted_indices = torch.sort(activated_values, descending=True)
+            top_percent_indices = sorted_indices[:threshold_index]
+            surface_id = torch.nonzero(near_face.bool(), as_tuple=False)[:,0][top_percent_indices]
+            rand_id = torch.cat((visable_index_change, activate_id[::50], surface_id[::10]))
+            # rand_id = torch.cat((activate_id[::50], surface_id[::10]))
+            # rand_id = torch.cat((visable_index_change, surface_id[::10]))
+            # rand_id = torch.cat((visable_index_change, activate_id[::50], ))
+            print(len(visable_index_change))
+            print(len(activate_id[::50]))
+            print(len(surface_id[::20]))
+            
+            # # # debug 可视化一下
+            # non_indices = sorted_indices[threshold_index:]  # 取出剩下的索引
+            # non_coords = torch.nonzero(near_face.bool(), as_tuple=False)[:, 0][non_indices]
+            # if (len(surface_id)>0):
+            #     near_face_grids = self.grid_pc[surface_id[::10]].cpu().numpy()
+            #     nf_pcd = o3d.geometry.PointCloud()
+            #     nf_pcd.points = o3d.utility.Vector3dVector(near_face_grids)
+            #     nf_pcd.colors = o3d.utility.Vector3dVector([[1, 0, 0] for _ in range(len(near_face_grids))])
+            #     near_grids = self.grid_pc[non_coords[::10]].cpu().numpy()
+            #     grid_pcd = o3d.geometry.PointCloud()
+            #     grid_pcd.points = o3d.utility.Vector3dVector(near_grids)
+            #     grid_pcd.colors = o3d.utility.Vector3dVector([[0.5, 0.5, 0.5] for _ in range(len(near_grids))])
+            #     o3d.visualization.draw_geometries([nf_pcd, grid_pcd])
+
+        # debug,测试rand_id只在表面附近分布
+        # near_face = (self.grid_sdf[:,0] < 0.15) & (self.grid_activate>0)
+        # activate_id = torch.nonzero(near_face)[:,0]
+        # rand_id = activate_id[::10] 
+        # # 可视化一下这部分
+
+        # # debug 可视化一下表面区域的法线对不对
+        # if t%300 == 0:
+        #     near_face = (self.grid_sdf[:,0] < 0.01) & (self.grid_activate>0)
+        #     near_face_id = torch.nonzero(near_face)[:,0]
+        #     use_grids = self.grid_pc[near_face_id].cpu().numpy()
+        #     grad = self.grid_sdf[near_face_id,3:6].cpu().numpy()
+        #     grid_pcd = o3d.geometry.PointCloud()
+        #     grid_pcd.points = o3d.utility.Vector3dVector(use_grids)
+        #     grid_pcd.colors = o3d.utility.Vector3dVector([[0, 1, 0] for _ in range(len(use_grids))])
+        #     lines = []
+        #     points_for_lines = []
+        #     for i, point in enumerate(use_grids):
+        #         closest_point = point+grad[i]/10
+        #         points_for_lines.append(point)
+        #         points_for_lines.append(closest_point)
+        #         lines.append([2 * i, 2 * i + 1])  # 每次添加两个点作为一条线的起点和终点
+        #     # 将 points 和 lines 传入 LineSet
+        #     lineset = o3d.geometry.LineSet()
+        #     lineset.points = o3d.utility.Vector3dVector(np.array(points_for_lines))
+        #     lineset.lines = o3d.utility.Vector2iVector(np.array(lines))
+        #     # 为每条线指定颜色
+        #     colors = [[1, 0, 0] for _ in range(len(lines))]  # 将线条设为红色
+        #     lineset.colors = o3d.utility.Vector3dVector(colors)
+        #     # 可视化点云和连线
+        #     o3d.visualization.draw_geometries([grid_pcd, lineset])
+        # if t%300 == 0:
+        #     near_face = (self.grid_sdf[:,0] < 0.01) & (self.grid_activate>0)
+        #     activate_id = torch.nonzero(near_face)[:,0]
+        #     grid_pcd = o3d.geometry.PointCloud()
+        #     near_face_grids = self.grid_pc[activate_id].cpu().numpy()
+        #     grid_pcd.points = o3d.utility.Vector3dVector(near_face_grids)
+        #     # 可视化点云和连线
+        #     o3d.visualization.draw_geometries([grid_pcd])
+        
+        grid_usd = self.grid_pc[rand_id]
+        do_sdf_grad = self.eik_weight != 0 or self.grad_weight != 0
+
+        if do_sdf_grad:
+            # 需要为张量计算梯度
+            grid_usd.requires_grad_()
+        # 把这些点云输入网络中，得到sdf值，这是输出加上噪声然后又缩放的结果
+        # grid_usd = torch.cat((grid_usd, gt_pc))
+        # print(len(grid_usd))
+        # print(len(gt_pc))
+        sdf = self.sdf_map(grid_usd, noise_std=self.noise_std)
+        # 求取误差
+        sdf_grad = None
+        if do_sdf_grad:
+            # 利用这些采样点，和对应的sdf，计算对当前网络输出的法线，也是[n,27,3]，是在每个点的三维方向
+            sdf_grad = fc_map.gradient(grid_usd, sdf)
+        # 计算sdf损失，trunc_distance用来判断是不是表面点，论文中有，free和surf的sdf计算方式还不一样，得到[n, 27]的损失
+        sdf_loss_mat, free_space_ixs = loss.sdf_loss(sdf, self.grid_sdf[rand_id, 0], self.trunc_distance, loss_type=self.loss_type)
+        # sdf_loss_mat, free_space_ixs = loss.sdf_loss(sdf, self.grid_sdf[rand_id, 0], 0.1, loss_type=self.loss_type)
+        # 计算eik的损失，就是看预测的grad法向量是不是1
+        eik_loss_mat = None
+        if self.eik_weight != 0:
+            eik_loss_mat = torch.abs(sdf_grad.norm(2, dim=-1) - 1)
+        # 计算grad的损失
+        grad_loss_mat = None
+        if self.grad_weight != 0:
+            # 计算grad损失就是我们认为的真值和sdf
+            grad_loss_mat = 1 - self.cosSim(self.grid_sdf[rand_id, 3:6], sdf_grad )
+            if self.orien_loss:
+                grad_loss_mat = (grad_loss_mat > 1).float()
+
+        #  可以在表面附近计算正负关系，保证表面精度，正为正，负为负
+        # difference = sdf[-len(near_face_id):] * self.grid_sdf[near_face_id, 0]
+        # sign_loss = torch.mean(torch.sigmoid(-difference * 1e+5))
+
+        # 计算总体损失，total_loss为最终平均值，total_loss_mat为每个点的值，losses为一个类，用来终端打印
+        total_loss, total_loss_mat, losses = loss.tot_loss(
+            sdf_loss_mat, grad_loss_mat, eik_loss_mat,
+            free_space_ixs, self.grid_sdf[rand_id, 0], self.eik_apply_dist,
+            self.trunc_weight, self.grad_weight, self.eik_weight,
+        )
+
+        # self.grid_sdf[rand_id, 2] = total_loss_mat.detach()
+
+        if if_time:
+            end_time = time.time()
+            print("The loss time is", end_time-start_time)
+            start_time = time.time()
+
+        # 返回这一训练批次的总loss，需要发布的loss类，分块的loss[n_used_kf, 8, 8]，分帧的loss[n_used_kf]
+        return (
+            total_loss,
+            losses,
+            rand_id
+        )
+
+
+    def step(self, t=0):
+        # 处理一次迭代的主要函数，计算loss
+        start, end = start_timing()
+        # 所有的关键帧的数据
+        depth_batch = self.frames.depth_batch
+        T_WC_batch = self.frames.T_WC_batch
+        # dyndyn：需要使用到frames的score
+        score_batch = self.frames.score_batch if self.do_normal else None
+        norm_batch = self.frames.normal_batch if self.do_normal else None
+        n_frames = len(self.frames)
+        idxs = [n_frames-1]
+        # 这些是选取出来进行训练的图像和轨迹数据
+        depth_this = depth_batch[idxs][0]
+        score_batch = score_batch[idxs][0]
+        T_WC_this = T_WC_batch[idxs][0]
+        norm_this = norm_batch[idxs][0]
+        total_loss, losses, rand_id_ok =  self.sdf_eval_and_loss_new(depth_this, T_WC_this,t, norm_this=norm_this, rand_id=self.rand_id_ok)
+        self.rand_id_ok = rand_id_ok
+        total_loss.backward()
+        # 优化器对参数进行优化
+        self.optimiser.step()
+        # total_params = sum(p.numel() for p in self.sdf_map.parameters())
+        # total_params += sum(p.numel() for p in self.sdf_map.buffers())
+        # print(f'{total_params:,} total parameters.')
+        # print(f'{total_params/(1024*1024):.2f}M total parameters.')
+        for param_group in self.optimiser.param_groups:
+            params = param_group["params"]
+            for param in params:
+                param.grad = None
+        # 记录现在时间
+        step_time = end_timing(start, end)
+        # 预热阶段不做时间处理
+        if t<200:
+            step_time = 0
+        time_s = step_time / 1000.
+        # 模拟速度为1，所以总时间就是加上花费的真实时间
+        self.tot_step_time += (1 / self.frac_time_perception) * time_s
+        # 处理的帧数加一
+        self.steps_since_frame += 1
+        return losses, step_time

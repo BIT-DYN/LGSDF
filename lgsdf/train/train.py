@@ -13,8 +13,7 @@ import argparse
 from torch.utils.tensorboard import SummaryWriter
 
 import sys
-print(os.path.abspath("../.."))
-sys.path.append(os.path.abspath("../.."))
+sys.path.append("/code/dyn/SDF/LGSDF")
 
 from lgsdf import visualisation
 from lgsdf.modules import trainer
@@ -48,16 +47,9 @@ def train(
     # saving init--------------------------------------------------------------
     # 建立保存目录
     save = save_path is not None
-    save_final = False
+    save_final = True
     save_grid_pc = False
-    if save_final:
-        now = datetime.now()
-        time_str = now.strftime("%m-%d-%y_%H-%M-%S")
-        save_final_path = "../../results/" + time_str
-        slice_final_path = os.path.join(save_final_path, 'slices')
-        os.makedirs(slice_final_path)
-        mesh_final_path = os.path.join(save_final_path, 'meshes')
-        os.makedirs(mesh_final_path)
+    eval_final = True
     if save_grid_pc:
         grid_pc_file = "../../results/"+"grid_sdf.npy"
     if save:
@@ -72,8 +64,8 @@ def train(
         if lgsdf_trainer.save_slices:
             slice_path = os.path.join(save_path, 'slices')
             os.makedirs(slice_path)
-            lgsdf_trainer.write_slices(
-                slice_path, prefix="0.000_", include_gt=True)
+            # lgsdf_trainer.write_slices(
+            #     slice_path, prefix="0.000_", include_gt=True)
         # 如果需要保存mesh，建立mesh子文件夹
         if lgsdf_trainer.save_meshes:
             mesh_path = os.path.join(save_path, 'meshes')
@@ -82,6 +74,20 @@ def train(
         writer = None
         if use_tensorboard:
             writer = SummaryWriter(save_path)
+            
+    if save_final:
+        if save:
+            save_final_path = save_path
+            slice_final_path = slice_path
+            mesh_final_path = mesh_path
+        else:
+            now = datetime.now()
+            time_str = now.strftime("%m-%d-%y_%H-%M-%S")
+            save_final_path = "../../results/" + time_str
+            slice_final_path = os.path.join(save_final_path, 'slices')
+            os.makedirs(slice_final_path)
+            mesh_final_path = os.path.join(save_final_path, 'meshes')
+            os.makedirs(mesh_final_path)
 
     # eval init--------------------------------------------------------------
     # 如果要进行评估的话，设置好评估内容res
@@ -113,16 +119,27 @@ def train(
                 if lgsdf_trainer.save_slices:
                     # 把当前slices保存下来
                     lgsdf_trainer.write_slices(slice_final_path, prefix="",
-                        include_gt=True, include_diff=False,
+                        include_gt=False, include_diff=False,
                         include_chomp=False, draw_cams=False)
                 if lgsdf_trainer.save_meshes:
-                    lgsdf_trainer.write_mesh(mesh_final_path + "/mesh.ply")
+                    lgsdf_trainer.write_mesh(mesh_final_path + "/mesh.ply", save_local =False)
                 if lgsdf_trainer.do_eval:
                     # 把当前评估结果保存下来
                     kf_list = lgsdf_trainer.frames.frame_id[:-1].tolist()
                     res['kf_indices'] = kf_list
                     with open(os.path.join(save_path, 'res.json'), 'w') as f:
                         json.dump(res, f, indent=4)
+            if eval_final:
+                visible_res = lgsdf_trainer.eval_sdf(samples=1000000, visible_region=True)
+                print("Time -------------------------------------------------------------------------------------------->", lgsdf_trainer.tot_step_time)
+                print("Visible region SDF error: {:.4f}".format(visible_res["av_l1"]))
+                print("Visible region SDF error using surf dis: {:.4f}".format(visible_res["surf_l1"]))
+                print("Visible region Bins error: ", visible_res["binned_l1"])
+                print("Visible region Chomp error: ", visible_res["l1_chomp_costs"])
+                acc, comp = lgsdf_trainer.eval_mesh()
+                print("Mesh accuracy and completion:", acc, comp)
+                print("have saved to", save_path)
+
             if save_grid_pc:
                 sdf = lgsdf_trainer.get_sdf_grid().cpu().numpy()
                 np.save(grid_pc_file,sdf)
@@ -141,8 +158,8 @@ def train(
                 add_new_frame = True
             else:
                 # 如果上一帧是关键帧，设置迭代次数再进行，否则加进来一个新的帧
-                add_new_frame = lgsdf_trainer.check_keyframe_latest()
-                # add_new_frame = True
+                # add_new_frame = lgsdf_trainer.check_keyframe_latest()
+                add_new_frame = True
             # 如果需要加入进来一个新的关键帧
             if add_new_frame:
                 # 如果已经达到关键帧指标，要加入最新的当前时刻的帧（太模拟实时了吧）
@@ -155,7 +172,7 @@ def train(
                           "**************************************")
                 else:
                     # 如果还没有结束，说明当前帧所处位置，和帧的id，其实是有关联的，差一个帧率作为倍数
-                    print("Total step time", lgsdf_trainer.tot_step_time)
+                    # print("Total step time", lgsdf_trainer.tot_step_time)
                     print("frame______________________", new_frame_id)
                     # 得到当前帧的数据，一个数据类型
                     frame_data = lgsdf_trainer.get_data([new_frame_id])
@@ -167,7 +184,7 @@ def train(
                         lgsdf_trainer.optim_frames = 200
         # optimisation step---------------------------------------------
         # 优化步骤，根据loss优化一次网络参数
-        losses, step_time = lgsdf_trainer.step()
+        losses, step_time = lgsdf_trainer.step(t=t)
         # 返回状态
         status = [k + ': {:.6f}  '.format(losses[k]) for k in losses.keys()]
         status = "".join(status) + '-- Step time: {:.2f}  '.format(step_time)
@@ -217,38 +234,38 @@ def train(
 
         # save ----------------------------------------------------------------
         # 如果要保存的话，就不用了,save_perio保存一次
-        if save and len(lgsdf_trainer.save_times) > 0:
-            if lgsdf_trainer.tot_step_time > lgsdf_trainer.save_times[0]:
-                save_t = f"{lgsdf_trainer.save_times.pop(0):.3f}"
-                print(
-                    f"Saving at {save_t}s",
-                    f" --  model {lgsdf_trainer.save_checkpoints} ",
-                    f"slices {lgsdf_trainer.save_slices} ",
-                    f"mesh {lgsdf_trainer.save_meshes} "
-                )
-                if lgsdf_trainer.save_checkpoints:
-                    torch.save(
-                        {
-                            "step": t,
-                            "model_state_dict":
-                                lgsdf_trainer.sdf_map.state_dict(),
-                            "optimizer_state_dict":
-                                lgsdf_trainer.optimiser.state_dict(),
-                            "loss": loss.item(),
-                        },
-                        os.path.join(
-                            checkpoint_path, "step_" + save_t + ".pth")
-                    )
-                if lgsdf_trainer.save_slices:
-                    lgsdf_trainer.write_slices(
-                        slice_path, prefix=save_t + "_",
-                        include_gt=False, include_diff=False,
-                        include_chomp=False, draw_cams=True)
-                if lgsdf_trainer.save_meshes:
-                    lgsdf_trainer.write_mesh(mesh_path + f"/{save_t}.ply")
+        # if save and len(lgsdf_trainer.save_times) > 0:
+        #     if lgsdf_trainer.tot_step_time > lgsdf_trainer.save_times[0]:
+        #         save_t = f"{lgsdf_trainer.save_times.pop(0):.3f}"
+        #         print(
+        #             f"Saving at {save_t}s",
+        #             f" --  model {lgsdf_trainer.save_checkpoints} ",
+        #             f"slices {lgsdf_trainer.save_slices} ",
+        #             f"mesh {lgsdf_trainer.save_meshes} "
+        #         )
+        #         if lgsdf_trainer.save_checkpoints:
+        #             torch.save(
+        #                 {
+        #                     "step": t,
+        #                     "model_state_dict":
+        #                         lgsdf_trainer.sdf_map.state_dict(),
+        #                     "optimizer_state_dict":
+        #                         lgsdf_trainer.optimiser.state_dict(),
+        #                     "loss": loss.item(),
+        #                 },
+        #                 os.path.join(
+        #                     checkpoint_path, "step_" + save_t + ".pth")
+        #             )
+        #         if lgsdf_trainer.save_slices:
+        #             lgsdf_trainer.write_slices(
+        #                 slice_path, prefix=save_t + "_",
+        #                 include_gt=False, include_diff=False,
+        #                 include_chomp=False, draw_cams=True)
+        #         if lgsdf_trainer.save_meshes:
+        #             lgsdf_trainer.write_mesh(mesh_path + f"/{save_t}.ply")
 
         # evaluation -----------------------------------------------------
-        # 如果评估的话，评估很多东西的话
+        # 如果评估vox的话，评估很多东西的话
         if len(lgsdf_trainer.eval_times) > 0:
             # 如果达到需要评估的时间点，即voxblox在这个时候评估了
             if lgsdf_trainer.tot_step_time > lgsdf_trainer.eval_times[0]:
@@ -265,7 +282,7 @@ def train(
             last_eval = lgsdf_trainer.tot_step_time - lgsdf_trainer.tot_step_time % lgsdf_trainer.eval_freq_s
             # 如果要进行sdf的评估
             if lgsdf_trainer.sdf_eval and lgsdf_trainer.gt_sdf_file is not None:
-                visible_res = lgsdf_trainer.eval_sdf(visible_region=True)
+                visible_res = lgsdf_trainer.eval_sdf(samples=1000000, visible_region=True)
                 # obj_errors = lgsdf_trainer.eval_object_sdf()
                 print("Time -------------------------------------------------------------------------------------------->", lgsdf_trainer.tot_step_time)
                 print("Visible region SDF error: {:.4f}".format(visible_res["av_l1"]))
@@ -338,13 +355,13 @@ if __name__ == "__main__":
     # vis，可视化使用的，多久更新一次
     show_obj = False
     update_im_freq = 80 #40
-    update_mesh_freq = 240 #200
+    update_mesh_freq = 250 #200
     if headless:
         update_im_freq = None
         update_mesh_freq = None
 
     # save，保存用的
-    save = False #False
+    save = True #False
     use_tensorboard = False # False
     if save:
         # 如果需要保存，会创建一个文件夹
@@ -361,7 +378,7 @@ if __name__ == "__main__":
         chkpt_load_file=chkpt_load_file,
         incremental=incremental,
         # vis
-        if_vis = True,
+        if_vis = False,
         show_obj=show_obj,
         update_im_freq=update_im_freq,
         update_mesh_freq=update_mesh_freq,
